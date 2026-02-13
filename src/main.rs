@@ -43,7 +43,7 @@ struct State {
 
 // --- 配置参数 ---
 const PROBE_COUNT: u32 = 10;       // 每轮探测次数
-const PENALTY_MS: u128 = 150;      // 失败惩罚分 (丢包权重)
+const PENALTY_MS: u128 = 300;      // 失败惩罚分 (丢包权重)
 const CONNECT_TIMEOUT: u64 = 1000; // (1000ms)1秒连接超时
 
 #[tokio::main]
@@ -75,9 +75,16 @@ async fn main() -> Result<()> {
             if let Some(winner) = perform_scoring_check(&config_clone.targets).await {
                 let mut s = state_clone.write().await;
                 
-                let changed = s.best.as_ref().map(|b| b.name != winner.name).unwrap_or(true);
-                if changed {
+                // 判断是否发生了切换
+                let is_changed = match &s.best {
+                    Some(current) => current.name != winner.name,
+                    None => true,
+                };
+
+                if is_changed {
                     log::info!(">>> 路由切换: 选定最优节点 [{}] ({})", winner.name, winner.addr);
+                } else {
+                    log::info!(">>> 保持最优: 当前最优节点 [{}] ({})", winner.name, winner.addr);
                 }
                 
                 s.best = Some(winner);
@@ -100,16 +107,13 @@ async fn main() -> Result<()> {
         if let Some(target) = target_info {
             let cfg = config.clone();
             tokio::spawn(async move {
-                if let Ok(addr) = client_stream.peer_addr() {
-                    log::info!("转发请求: {} -> [{}]", addr, target.name);
-                    let _ = handle_forward(client_stream, target, cfg).await;
-                }
+                let _ = handle_forward(client_stream, target, cfg).await;
             });
         }
     }
 }
 
-/// 执行评分探测 (按指定中文格式输出)
+/// 执行评分探测 
 async fn perform_scoring_check(targets: &[TargetConfig]) -> Option<BestTarget> {
     let tasks = targets.iter().map(|t| {
         let t = t.clone();
@@ -150,11 +154,9 @@ async fn perform_scoring_check(targets: &[TargetConfig]) -> Option<BestTarget> {
                 None
             } else {
                 let fail_count = PROBE_COUNT - success_count;
-                // Score 计算公式: (响应时间总和 + 丢包数*惩罚) / 总次数
                 let final_score = (valid_rtt_sum + (fail_count as u128 * PENALTY_MS)) / PROBE_COUNT as u128;
                 let avg_ms = valid_rtt_sum / success_count as u128;
 
-                // 按照要求的格式打印日志
                 log::info!(
                     "[{}] ({}) 评分: {} (最低延迟: {}, 最高延迟: {}, 平均延迟: {}, 丢包: {}/{})", 
                     t.name, 
