@@ -15,6 +15,7 @@ rust-ForwardOptimal
 再对 最低延迟 的目标进行TCP转发
 
 
+```yaml
 
 # 监听本地地址
 bind_addr: "0.0.0.0:8080"
@@ -34,6 +35,7 @@ targets:
   - name: "IPV6-VPS-1"
     addr: "[2607:f8b0:400a:80c::200e]:443"
 
+```
 
 # 启动方式
 forward-optimal /root/config.yaml
