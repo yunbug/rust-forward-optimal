@@ -55,7 +55,7 @@ forward-optimal -c /root/config.yaml
 
 ```shell
 mkdir /etc/forward-optimal/
-wget -P /etc/forward-optimal "https://github.com/yunbug/rust-ForwardOptimal/releases/download/v1.0.0/forward-optimal"
+wget -P /etc/forward-optimal "https://github.com/yunbug/rust-ForwardOptimal/releases/download/v1.0.1/forward-optimal"
 chmod 777 /etc/forward-optimal/forward-optimal
 
 ```
