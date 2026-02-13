@@ -1,0 +1,17 @@
+# 监听本地地址
+bind_addr: "0.0.0.0:8080"
+
+# 检测间隔（秒）
+update_interval: 60
+
+# 是否开启 Proxy Protocol (可选: "v2" 或留空)，不懂就留空
+proxy_protocol: ""
+
+# 目标服务器列表
+targets:
+  - name: "Cloudflare"
+    addr: "1.1.1.1:80"
+  - name: "DNS"
+    addr: "8.8.8.8:80"
+  - name: "IPV6-VPS-1"
+    addr: "[2607:f8b0:400a:80c::200e]:443"

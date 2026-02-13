@@ -1,0 +1,192 @@
+use anyhow::{Context, Result};
+use futures::future::join_all;
+use serde::Deserialize;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{self, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock;
+
+#[derive(Debug, Deserialize, Clone)]
+struct TargetConfig {
+    name: String,
+    addr: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct Config {
+    bind_addr: String,
+    targets: Vec<TargetConfig>,
+    update_interval: u64,
+    proxy_protocol: Option<String>,
+}
+
+#[derive(Clone)]
+struct BestTarget {
+    addr: SocketAddr,
+    name: String,
+    rtt: Duration,
+}
+
+struct State {
+    best: Option<BestTarget>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // 初始化日志，默认级别为 info
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+
+    // 1. 加载并解析 YAML 配置
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.yaml".to_string());
+    let config_content = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("无法读取配置文件: {}", config_path))?;
+    let config: Config = serde_yaml::from_str(&config_content)
+        .with_context(|| "解析 YAML 失败，请检查格式")?;
+
+    let state = Arc::new(RwLock::new(State { best: None }));
+
+    // 2. 启动并发探测任务
+    let state_clone = state.clone();
+    let config_clone = config.clone();
+    tokio::spawn(async move {
+        loop {
+            log::info!("--------------------------------------------------");
+            log::info!("开始并发探测 (目标数: {})", config_clone.targets.len());
+            
+            if let Some(best_node) = perform_parallel_check(&config_clone.targets).await {
+                let mut s = state_clone.write().await;
+                s.best = Some(best_node.clone());
+                log::info!(">>> 探测结束: 最优节点 [{}] ({}) - {}ms", 
+                    best_node.name, best_node.addr, best_node.rtt.as_millis());
+            } else {
+                log::error!(">>> 探测结束: 所有节点均不可达！");
+            }
+            
+            log::info!("--------------------------------------------------");
+            tokio::time::sleep(Duration::from_secs(config_clone.update_interval)).await;
+        }
+    });
+
+    // 3. 启动 TCP 转发服务
+    let listener = TcpListener::bind(&config.bind_addr).await
+        .with_context(|| format!("无法绑定地址 {}", config.bind_addr))?;
+    log::info!("转发服务运行中: {}", config.bind_addr);
+
+    loop {
+        let (client_stream, client_addr) = listener.accept().await?;
+        
+        // 优化：开启 TCP_NODELAY 降低转发延迟
+        let _ = client_stream.set_nodelay(true);
+
+        let target_info = {
+            let state_guard = state.read().await;
+            state_guard.best.clone()
+        };
+
+        if let Some(target) = target_info {
+            let cfg = config.clone();
+            tokio::spawn(async move {
+                if let Err(e) = handle_forward(client_stream, client_addr, target, cfg).await {
+                    log::debug!("转发连接断开 [{}]: {}", client_addr, e);
+                }
+            });
+        }
+    }
+}
+
+/// 优化：使用 join_all 并发探测所有目标
+async fn perform_parallel_check(targets: &[TargetConfig]) -> Option<BestTarget> {
+    let tasks = targets.iter().map(|t| {
+        let t = t.clone();
+        async move {
+            // 解析域名 (仅取第一个 IP)
+            let addr = match tokio::net::lookup_host(&t.addr).await {
+                Ok(mut addrs) => addrs.next()?,
+                Err(_) => return None,
+            };
+
+            let start = Instant::now();
+            // 尝试建立连接，超时时间 2 秒
+            let connect_timeout = Duration::from_secs(2);
+            match tokio::time::timeout(connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(_)) => {
+                    let rtt = start.elapsed();
+                    log::info!("  [成功] 节点: {:<12} | 地址: {:<20} | 延迟: {}ms", 
+                        t.name, addr, rtt.as_millis());
+                    Some(BestTarget { addr, name: t.name, rtt })
+                }
+                _ => {
+                    log::warn!("  [超时] 节点: {:<12} | 地址: {:<20}", t.name, addr);
+                    None
+                }
+            }
+        }
+    });
+
+    // 并发执行并收集结果
+    let results = join_all(tasks).await;
+    
+    // 找出 RTT 最小的有效结果
+    results.into_iter()
+        .flatten()
+        .min_by_key(|node| node.rtt)
+}
+
+/// 优化：使用 copy_bidirectional 进行高效双向流传输
+async fn handle_forward(
+    mut client: TcpStream,
+    client_addr: SocketAddr,
+    target: BestTarget,
+    config: Config,
+) -> Result<()> {
+    let mut server = TcpStream::connect(target.addr).await?;
+    let _ = server.set_nodelay(true);
+
+    // 发送 Proxy Protocol v2 头部
+    if let Some(ref proto) = config.proxy_protocol {
+        if proto == "v2" {
+            let header = build_proxy_v2_header(client_addr, target.addr);
+            server.write_all(&header).await?;
+        }
+    }
+
+    // 优化：直接在两个 Stream 之间进行双向拷贝
+    // 这种方式比手动 split + try_join 更简洁且性能一致
+    io::copy_bidirectional(&mut client, &mut server).await?;
+    
+    Ok(())
+}
+
+/// 构造 Proxy Protocol v2 二进制头部
+fn build_proxy_v2_header(src: SocketAddr, dst: SocketAddr) -> Vec<u8> {
+    let mut header = Vec::with_capacity(32);
+    // PPv2 Signature
+    header.extend_from_slice(b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A");
+    header.push(0x21); // Ver 2, Cmd Proxy
+
+    match (src, dst) {
+        (SocketAddr::V4(s), SocketAddr::V4(d)) => {
+            header.push(0x11); // AF_INET, STREAM
+            header.extend_from_slice(&12u16.to_be_bytes()); // Length
+            header.extend_from_slice(&s.ip().octets());
+            header.extend_from_slice(&d.ip().octets());
+            header.extend_from_slice(&s.port().to_be_bytes());
+            header.extend_from_slice(&d.port().to_be_bytes());
+        }
+        (SocketAddr::V6(s), SocketAddr::V6(d)) => {
+            header.push(0x21); // AF_INET6, STREAM
+            header.extend_from_slice(&36u16.to_be_bytes()); // Length
+            header.extend_from_slice(&s.ip().octets());
+            header.extend_from_slice(&d.ip().octets());
+            header.extend_from_slice(&s.port().to_be_bytes());
+            header.extend_from_slice(&d.port().to_be_bytes());
+        }
+        _ => {
+            header.push(0x00); // UNSPEC
+            header.extend_from_slice(&0u16.to_be_bytes());
+        }
+    }
+    header
+}
