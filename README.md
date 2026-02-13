@@ -48,7 +48,7 @@ forward-optimal -c /root/config.yaml
 
 
 
-### 其他（进程守护）
+### 其他（下载）
 
 ```shell
 mkdir /etc/forward-optimal/
