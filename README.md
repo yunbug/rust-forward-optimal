@@ -37,7 +37,7 @@ targets:
 
 ```
 
-# 启动方式
+##  启动方式
 ```code
 
 forward-optimal /root/config.yaml
